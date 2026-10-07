@@ -51,48 +51,17 @@ final class LayoutCapturer {
         currentSetKey = setKey
 
         let live = WindowManager.currentWindows()
-        var layouts: [WindowLayout] = []
-        let now = Date()
+        let snapshot = Snapshot(live: live, displays: displays,
+                                saved: LayoutStore.shared.record(for: setKey)?.windows ?? [],
+                                protected: LayoutRestorer.pendingWindowIDs(for: setKey))
+        let layouts = snapshot.windows
+        let replaced = snapshot.replaced
 
-        // Saved windows the user has moved onto the built-in screen: forget them, rather than
-        // pulling them back to this monitor. Resolved with the same matcher restore uses, so
-        // the two always agree about which open window a saved entry refers to. Keying this on
-        // the window index instead made entries churn, because an app's window indices shift as
-        // its windows come and go.
-        var movedToBuiltIn = Set<String>()
-        if let saved = LayoutStore.shared.record(for: setKey)?.windows {
-            let matched = LayoutMatcher.match(saved, to: live)
-            for (i, win) in matched {
-                if WindowManager.display(for: win, in: displays)?.isBuiltin == true {
-                    movedToBuiltIn.insert(saved[i].id)
-                }
-            }
-        }
-
-        for win in live {
-            // Only remember windows that live on an external display.
-            guard let disp = WindowManager.display(for: win, in: displays), !disp.isBuiltin else { continue }
-            // Store the position RELATIVE to the display's origin, so restore works even when
-            // the display comes back at a different arrangement origin next session.
-            layouts.append(WindowLayout(
-                appBundleID: win.appBundleID,
-                appName: win.appName,
-                displayUUID: disp.uuid,
-                windowTitle: win.title,
-                windowIndex: win.index,
-                x: win.frame.origin.x - disp.bounds.origin.x,
-                y: win.frame.origin.y - disp.bounds.origin.y,
-                width: win.frame.size.width, height: win.frame.size.height,
-                updatedAt: now
-            ))
-        }
-
-        guard !layouts.isEmpty else { return }
+        guard !layouts.isEmpty || !replaced.isEmpty else { return }
 
         // Diff: skip the write if the layout is unchanged (ignore timestamps).
-        let hash = (layouts.map { "\($0.appBundleID)\($0.windowIndex)\($0.x)\($0.y)\($0.width)\($0.height)" }
-            + movedToBuiltIn.sorted().map { "builtin:\($0)" })
-            .joined().hashValue
+        let hash = ([setKey] + layouts.map { "\($0.id)|\($0.displayUUID)|\($0.windowTitle)|\($0.x)|\($0.y)|\($0.width)|\($0.height)" }.sorted()
+            + replaced.sorted()).joined(separator: "\n").hashValue
         // Skip unchanged snapshots, but still write about once a day: the write refreshes each
         // window's "last seen" time, which is what keeps a window that simply never moves from
         // being mistaken for a closed one by the 30-day cleanup.
@@ -104,8 +73,53 @@ final class LayoutCapturer {
             setKey: setKey,
             displays: DisplayInfo.records(for: displays),
             windows: layouts,
-            evictSlots: movedToBuiltIn
+            evictSlots: replaced
         )
         Log.write("captured \(layouts.count) window(s) for \(externals.map { $0.localizedName }.joined(separator: " + "))")
+    }
+
+    /// A partial view of the desktop must never replace an entire monitor's history.
+    struct Snapshot {
+        var windows: [WindowLayout]
+        var replaced: Set<String>
+
+        init(live: [LiveWindow], displays: [LiveDisplay], saved: [WindowLayout], protected: Set<String>) {
+            var layouts: [WindowLayout] = []
+            let now = Date()
+
+            let matched = LayoutMatcher.match(saved, to: live)
+            let protectedWindows = Set(matched.compactMap { i, win in
+                protected.contains(saved[i].id) ? win.identity : nil
+            })
+            // Replace matched entries only when observed on screen and fully restored. Inactive
+            // Spaces may still have macOS's temporary laptop frames after a disconnect.
+            let replaced = Set(matched.compactMap { i, win -> String? in
+                guard win.isOnScreen, !protected.contains(saved[i].id),
+                      WindowManager.display(for: win, in: displays) != nil else { return nil }
+                return saved[i].id
+            })
+
+            for win in live where win.isOnScreen && !protectedWindows.contains(win.identity) {
+                // Only remember windows that live on an external display.
+                guard let disp = WindowManager.display(for: win, in: displays), !disp.isBuiltin else { continue }
+                // Store the position RELATIVE to the display's origin, so restore works even when
+                // the display comes back at a different arrangement origin next session.
+                layouts.append(WindowLayout(
+                    appBundleID: win.appBundleID,
+                    appName: win.appName,
+                    displayUUID: disp.uuid,
+                    windowTitle: win.title,
+                    windowIndex: win.index,
+                    x: win.frame.origin.x - disp.bounds.origin.x,
+                    y: win.frame.origin.y - disp.bounds.origin.y,
+                    width: win.frame.size.width, height: win.frame.size.height,
+                    updatedAt: now,
+                    identity: win.identity
+                ))
+            }
+
+            windows = layouts
+            self.replaced = replaced
+        }
     }
 }

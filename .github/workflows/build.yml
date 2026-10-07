@@ -17,3 +17,5 @@ jobs:
         run: swift build -c release
       - name: Debug build (includes the development harness)
         run: swift build
+      - name: Tests
+        run: swift test

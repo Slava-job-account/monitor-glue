@@ -1,26 +1,49 @@
 import AppKit
 import ApplicationServices
+import Darwin
 
 /// A live window read from the Accessibility API.
 struct LiveWindow {
     var element: AXUIElement
     var appBundleID: String
     var appName: String
-    var pid: pid_t
     var title: String
     var index: Int          // Index within the app's window list.
     var frame: CGRect       // AX global coords (top-left origin).
+    var identity: WindowIdentity
+    var isOnScreen: Bool = true
+}
+
+/// Window numbers survive Space switches, but may be reused after the owning app exits.
+struct WindowIdentity: Codable, Hashable {
+    var pid: pid_t
+    var launchedAt: TimeInterval
+    var number: CGWindowID
+
+    var key: String { "\(pid):\(launchedAt):\(number)" }
+    var isRunning: Bool { NSRunningApplication(processIdentifier: pid)?.launchDate?.timeIntervalSince1970 == launchedAt }
 }
 
 /// Reads and repositions other applications' windows via the Accessibility API.
 /// All coordinates are AX global (top-left origin), matching `CGDisplayBounds`.
 enum WindowManager {
 
+    // AXWindows may omit inactive Spaces. Retain references learned on earlier visits;
+    // invalidate them when their window closes or the owning process exits.
+    private static var knownWindows: [WindowIdentity: LiveWindow] = [:]
+    private typealias WindowNumber = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+    private static let windowNumber: WindowNumber? = {
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow") else {
+            Log.write("window tracking unavailable — macOS window identity API is missing")
+            return nil
+        }
+        return unsafeBitCast(symbol, to: WindowNumber.self)
+    }()
+
     // MARK: Enumeration
 
     static func currentWindows() -> [LiveWindow] {
         guard AXIsProcessTrusted() else { return [] }
-        var result: [LiveWindow] = []
         let ownPID = ProcessInfo.processInfo.processIdentifier
         // Per-bundle counter so indices are dense and unique even when an app has several
         // processes sharing one bundle ID (Chrome profiles) or windows were filtered out.
@@ -30,7 +53,8 @@ enum WindowManager {
         for app in NSWorkspace.shared.runningApplications {
             guard app.activationPolicy == .regular,
                   app.processIdentifier != ownPID,
-                  let bundleID = app.bundleIdentifier else { continue }
+                  let bundleID = app.bundleIdentifier,
+                  let launchedAt = app.launchDate?.timeIntervalSince1970 else { continue }
 
             let appElement = AXUIElementCreateApplication(app.processIdentifier)
             // Right after a display change apps are busy re-laying out and answer AX slowly.
@@ -52,18 +76,41 @@ enum WindowManager {
                 let title = (copyValue(win, kAXTitleAttribute) as? String) ?? ""
                 let idx = nextIndex[bundleID, default: 0]
                 nextIndex[bundleID] = idx + 1
-                result.append(LiveWindow(
+                var number: CGWindowID = 0
+                guard windowNumber?(win, &number) == .success, number != 0 else { continue }
+                let identity = WindowIdentity(pid: app.processIdentifier, launchedAt: launchedAt, number: number)
+                knownWindows[identity] = LiveWindow(
                     element: win,
                     appBundleID: bundleID,
                     appName: app.localizedName ?? bundleID,
-                    pid: app.processIdentifier,
                     title: title,
                     index: idx,
-                    frame: frame
-                ))
+                    frame: frame,
+                    identity: identity
+                )
             }
         }
-        return result
+        let visible = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        let visibleIDs = Set(visible.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
+        var windows: [LiveWindow] = []
+        for (identity, var window) in knownWindows {
+            var role: CFTypeRef?
+            let error = AXUIElementCopyAttributeValue(window.element, kAXRoleAttribute as CFString, &role)
+            guard identity.isRunning, error != .invalidUIElement else {
+                knownWindows.removeValue(forKey: identity)
+                continue
+            }
+            guard let frame = frame(of: window.element) else { continue }
+            // Minimized and fullscreen windows remain cached for when they return to normal.
+            guard (copyValue(window.element, "AXFullScreen") as? Bool) != true else { continue }
+            guard (copyValue(window.element, kAXMinimizedAttribute) as? Bool) != true else { continue }
+            window.frame = frame
+            window.title = (copyValue(window.element, kAXTitleAttribute) as? String) ?? window.title
+            window.isOnScreen = visibleIDs.contains(identity.number)
+            windows.append(window)
+        }
+        return windows
     }
 
     // MARK: Frame read/write

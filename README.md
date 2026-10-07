@@ -29,6 +29,7 @@ puts them back — right monitor, right position, right size — the moment you 
 - **Restores automatically** when a monitor connects, when you open the lid, when the Mac wakes,
   and when you unlock. If you plug in at the lock screen, it waits and places everything the
   moment you unlock.
+- **Remembers windows across Spaces.** Restores windows across all Spaces.
 - **Respects your changes.** Resize a window on the monitor and that becomes its new place.
   Drag a window to the laptop screen and it stays there — it won't be yanked back.
 - **Copes with stubborn apps.** Some apps refuse certain sizes (Slack has a minimum width);
@@ -79,13 +80,18 @@ windows — never their contents. Everything else stays on your Mac:
   under — so a home monitor and an office monitor never share a layout.
 - **Positions are stored relative to the monitor's own origin.** macOS often brings a display
   back at a different place in its arrangement; relative coordinates still land correctly.
-- **Windows are read and moved with the Accessibility API**, matched back to saved entries by
-  title, then by position in the app's window list.
+- **Windows are read and moved with the Accessibility API**, identified by their window number and owning process's launch time. After an app restarts, only an unambiguous title match is used; ambiguous windows are learned again when visited.
 - **Restores retry for up to three minutes**, quickly at first. Right after a wake, apps can be
   unresponsive to Accessibility for a while, and some apps are still relaunching.
 - **Why it isn't on the Mac App Store:** App Store apps must run in the App Sandbox, and the
   sandbox hides other apps' windows from the Accessibility API. We tested it: the sandboxed
   build was told it was trusted and then saw zero windows.
+
+### Multiple Spaces
+
+Visit each Space while the monitor is connected to let Monitor Glue learn its windows. Captures update only visible windows and preserve the other Spaces. After reconnecting, Monitor Glue attempts to restore all remembered windows, including retained windows on inactive Spaces, without switching your desktop. Windows that are unavailable remain pending and are retried when you visit their Space or activate their app. Window references must be learned again after Monitor Glue restarts.
+
+Monitor Glue restores positions within existing Spaces. It does not recreate deleted Spaces or reassign windows between Spaces if macOS changes their membership. Minimized and fullscreen windows are not supported. Window identity uses the undocumented, read-only `_AXUIElementGetWindow` function; it does not require disabling SIP. Native multi-Space behavior needs testing with your apps and macOS version.
 
 ## Troubleshooting
 
@@ -114,6 +120,8 @@ rebuilds keep the permission.
 `CONFIG=debug ./Scripts/bundle.sh` builds into `dist/debug/` with a development harness
 compiled in (`MG_PREVIEW=menu`, `manager`, `diag`, and friends — see `DebugPreview.swift`).
 Release builds leave all of it out.
+
+Run the regression tests with `swift test` using full Xcode 15 or later (Swift 5.9+ and XCTest). For a manual check, put two windows of the same app with the same title in different Spaces, visit both while docked, disconnect, then reconnect. Verify that windows on all Spaces restore without switching desktops. For windows that remain unavailable, check restoration when visiting their Space more than three minutes later. Resize a restored window and verify it stays resized when visiting another Space. Quit and reopen an app to check that ambiguous windows are not assigned each other's saved frames. Hide an app with Command-H before reconnecting, then unhide it without changing Spaces: its windows should restore, and subsequent resizing should be remembered.
 
 ## Contributing
 

@@ -12,19 +12,20 @@ struct DisplayInfoRecord: Codable, Hashable {
 
 /// A remembered window's saved frame on a specific external display.
 struct WindowLayout: Codable, Hashable, Identifiable {
-    var id: String { "\(appBundleID)#\(displayUUID)#\(windowIndex)#\(windowTitle)" }
+    var id: String { identity?.key ?? "\(appBundleID)#\(displayUUID)#\(windowIndex)#\(windowTitle)" }
 
     var appBundleID: String
     var appName: String
     var displayUUID: String
     var windowTitle: String
     var windowIndex: Int
-    // Frame in AX global (top-left origin) coordinates.
+    // Frame relative to the saved display origin (top-left coordinates).
     var x: Double
     var y: Double
     var width: Double
     var height: Double
     var updatedAt: Date
+    var identity: WindowIdentity? = nil
 
     var frame: CGRect {
         get { CGRect(x: x, y: y, width: width, height: height) }
@@ -40,6 +41,13 @@ struct MonitorSetRecord: Codable, Identifiable {
     var displays: [DisplayInfoRecord]
     var lastSeen: Date
     var windows: [WindowLayout]
+
+    /// Merge only observed windows, preserving windows on unvisited Spaces.
+    mutating func merge(_ captured: [WindowLayout], evicting ids: Set<String>) {
+        let replaced = ids.union(captured.map(\.id))
+        windows.removeAll { replaced.contains($0.id) }
+        windows.append(contentsOf: captured)
+    }
 
     /// Human label like "DELL U2720Q + LG HDR 4K".
     var label: String {
@@ -115,15 +123,9 @@ final class LayoutStore {
 
     /// Upsert a monitor set's metadata and merge in freshly captured windows.
     ///
-    /// Merges rather than replaces. A snapshot only sees windows that are on the external
-    /// display right now, so replacing wholesale would forget an app that is currently closed,
-    /// or one whose window the user happens to have parked on the built-in screen. Entries not
-    /// present in this snapshot are kept as they were, which is also what makes sizes "belong"
-    /// to the monitor: only a change made while the window is on that monitor updates it.
-    /// - Parameter evictSlots: ids of saved windows whose open window is currently on the
-    ///   built-in display. The user moved them off this monitor deliberately, so stop managing
-    ///   them here. A saved window with no live window at all is left alone - that is an app
-    ///   that simply is not open.
+    /// Unobserved Spaces retain their saved windows. Matched entries are replaced by the
+    /// snapshot (including legacy identities); windows moved to the laptop are only evicted.
+    /// - Parameter evictSlots: saved IDs replaced or deliberately moved off the monitor.
     func upsert(setKey: String, displays: [DisplayInfoRecord], windows: [WindowLayout],
                 evictSlots: Set<String> = []) {
         queue.sync {
@@ -132,20 +134,7 @@ final class LayoutStore {
             record.displays = displays
             record.lastSeen = Date()
 
-            // Key by app + window index, which is how restore matches them back up.
-            func slot(_ w: WindowLayout) -> String { "\(w.appBundleID)#\(w.windowIndex)" }
-            var merged = record.windows
-            for captured in windows {
-                if let existing = merged.firstIndex(where: { slot($0) == slot(captured) }) {
-                    merged[existing] = captured
-                } else {
-                    merged.append(captured)
-                }
-            }
-            if !evictSlots.isEmpty {
-                merged.removeAll { evictSlots.contains($0.id) }
-            }
-            record.windows = merged
+            record.merge(windows, evicting: evictSlots)
             data.monitorSets[setKey] = LayoutStore.pruned(record)
         }
         save()
@@ -154,11 +143,11 @@ final class LayoutStore {
     /// Record the frame a window actually ended up with, when the app refused the saved one
     /// (Slack will not go below its minimum width, for example). Without this the app would
     /// keep trying to apply a size that can never be reached.
-    func replaceFrame(setKey: String, bundleID: String, windowIndex: Int, with frame: CGRect) {
+    func replaceFrame(setKey: String, windowID: String, with frame: CGRect) {
         queue.sync {
             guard var record = data.monitorSets[setKey] else { return }
             guard let i = record.windows.firstIndex(where: {
-                $0.appBundleID == bundleID && $0.windowIndex == windowIndex
+                $0.id == windowID
             }) else { return }
             record.windows[i].frame = frame
             record.windows[i].updatedAt = Date()

@@ -65,6 +65,7 @@ final class AppModel: ObservableObject {
     private var pollTimer: Timer?
     /// Set while a restore for this monitor set has not yet placed every saved window.
     private var restorePendingKey: String?
+    private var restoreGeneration = 0
     private var recheckDebounce: DispatchWorkItem?
 
     func start() {
@@ -79,6 +80,18 @@ final class AppModel: ObservableObject {
         }
         watcher.start()
         observeWakeEvents()
+        // Hidden apps can become visible without a Space change.
+        for name in [NSWorkspace.activeSpaceDidChangeNotification,
+                     NSWorkspace.didUnhideApplicationNotification,
+                     NSWorkspace.didActivateApplicationNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] _ in
+                // Suppress capture before the transition can expose temporary laptop frames.
+                LayoutCapturer.shared.suppressCapture(for: 2)
+                self?.resumePendingRestore()
+            }
+        }
         currentSetKey = watcher.currentKey
         LayoutCapturer.shared.currentSetKey = currentSetKey
 
@@ -149,6 +162,8 @@ final class AppModel: ObservableObject {
     }
 
     private func handleSetChange(_ key: String) {
+        restoreGeneration += 1
+        restorePendingKey = nil
         currentSetKey = key
         LayoutCapturer.shared.currentSetKey = key
         let known = !key.isEmpty && LayoutStore.shared.record(for: key) != nil
@@ -166,11 +181,19 @@ final class AppModel: ObservableObject {
     /// Capture stays suppressed for as long as a restore is unfinished. Otherwise a failed
     /// restore gets immortalised: macOS leaves the windows at their built-in-display sizes, and
     /// the next snapshot overwrites the good saved layout with those sizes.
-    private func restoreWithRetries(_ key: String) {
+    private func resumePendingRestore() {
+        let key = currentSetKey
+        guard !key.isEmpty, !LayoutRestorer.pendingWindowIDs(for: key).isEmpty,
+              restorePendingKey != key else { return }
+        restoreWithRetries(key, newCycle: false)
+    }
+
+    private func restoreWithRetries(_ key: String, newCycle: Bool = true) {
+        restoreGeneration += 1
         restorePendingKey = key
-        LayoutRestorer.beginCycle()
+        if newCycle { LayoutRestorer.beginCycle(setKey: key) }
         LayoutCapturer.shared.suppressCapture(for: 10)
-        attemptRestore(key, elapsed: 0)
+        attemptRestore(key, elapsed: 0, generation: restoreGeneration, enforcePlaced: newCycle)
     }
 
     /// One restore attempt, rescheduling itself until the layout is on screen. The interval is
@@ -178,12 +201,13 @@ final class AppModel: ObservableObject {
     /// answering the Accessibility API slowly after the display change — polling every few
     /// hundred milliseconds means we place the windows as soon as they become visible to us,
     /// instead of waiting out a sparse fixed schedule.
-    private func attemptRestore(_ key: String, elapsed: Double, lockedWait: Bool = false) {
+    private func attemptRestore(_ key: String, elapsed: Double, generation: Int, enforcePlaced: Bool, lockedWait: Bool = false) {
         // While locked there is nothing to poll for quickly; check back at a calm pace.
         let interval: Double = lockedWait ? 2.0 : (elapsed < 10 ? 0.4 : (elapsed < 30 ? 1.0 : 3.0))
         let giveUpAfter = 180.0
 
         DispatchQueue.main.asyncAfter(deadline: .now() + interval) {
+            guard self.restoreGeneration == generation else { return }
             guard self.currentSetKey == key else { return }         // display changed again
             guard self.restorePendingKey == key else { return }      // already satisfied
 
@@ -192,14 +216,14 @@ final class AppModel: ObservableObject {
                 // not let the give-up clock run down, or unlocking ten minutes later would
                 // find capture already recording a layout that was never restored.
                 LayoutCapturer.shared.suppressCapture(for: 45)
-                self.attemptRestore(key, elapsed: elapsed, lockedWait: true)
+                self.attemptRestore(key, elapsed: elapsed, generation: generation, enforcePlaced: enforcePlaced, lockedWait: true)
                 return
             }
 
             // For the first few seconds keep asserting the saved frames, since macOS is still
             // shuffling windows. After that, respect windows already placed in this cycle so
             // resizing one actually sticks while we wait for some other app to reopen.
-            let outcome = LayoutRestorer.restore(setKey: key, enforce: elapsed < 5)
+            let outcome = LayoutRestorer.restore(setKey: key, enforce: enforcePlaced && elapsed < 5)
             if outcome.isComplete {
                 self.restorePendingKey = nil
                 // Layout is on screen — let capture take over again shortly.
@@ -222,16 +246,16 @@ final class AppModel: ObservableObject {
                 // again (e.g. the saved app was closed for good).
                 self.restorePendingKey = nil
                 LayoutCapturer.shared.resumeCapture()
-                Log.write("restore for key=\(key.prefix(8)) never completed after \(Int(next))s — resuming capture; saved layout may now be overwritten by what is on screen")
+                Log.write("restore for key=\(key.prefix(8)) never completed after \(Int(next))s — resuming capture; unplaced windows remain protected until their Space becomes available")
                 return
             }
-            self.attemptRestore(key, elapsed: next)
+            self.attemptRestore(key, elapsed: next, generation: generation, enforcePlaced: enforcePlaced)
         }
     }
 
     func restoreNow() {
         guard !currentSetKey.isEmpty else { return }
-        LayoutRestorer.restore(setKey: currentSetKey)
+        restoreWithRetries(currentSetKey)
     }
 
     func refreshStatus() {

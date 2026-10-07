@@ -1,7 +1,7 @@
 import AppKit
 
 /// Repositions windows to their saved frames when a known monitor set reconnects.
-/// Matching is best-effort: bundle ID is required, then exact title, then window index.
+/// Inaccessible Spaces remain pending until their windows become available.
 enum LayoutRestorer {
 
     /// Last logged outcome and how many identical ones followed it. Retries now run several
@@ -9,11 +9,13 @@ enum LayoutRestorer {
     private static var lastSignature = ""
     private static var suppressedRepeats = 0
 
-    /// Layouts already placed during the current restore cycle. Retries keep running while some
-    /// other window is still missing (its app may yet reopen), and without this they would keep
-    /// re-applying the saved frame to windows that are already done - overriding the user every
-    /// few seconds when they resize one.
-    private static var placedThisCycle = Set<String>()
+    /// Unplaced saved IDs stay protected from capture, even after retries stop.
+    private static var cycleKey = ""
+    private static var pending = Set<String>()
+
+    static func pendingWindowIDs(for key: String) -> Set<String> {
+        key == cycleKey ? pending : []
+    }
 
     /// The frame each layout actually ended up with on the previous attempt. Some apps refuse a
     /// size outright (Slack will not go narrower than its minimum), so the target can never be
@@ -22,8 +24,9 @@ enum LayoutRestorer {
     private static var lastAchieved = [String: CGRect]()
 
     /// Start a new restore cycle for a display change; forget what was placed in the last one.
-    static func beginCycle() {
-        placedThisCycle.removeAll()
+    static func beginCycle(setKey: String) {
+        cycleKey = setKey
+        pending = Set(LayoutStore.shared.record(for: setKey)?.windows.map(\.id) ?? [])
         lastAchieved.removeAll()
     }
 
@@ -55,6 +58,7 @@ enum LayoutRestorer {
             return Outcome()
         }
 
+        pending.formIntersection(record.windows.map(\.id))
         let displays = DisplayInfo.liveDisplays()
         let live = WindowManager.currentWindows()
         let liveByBundle = Dictionary(grouping: live, by: { $0.appBundleID })
@@ -79,17 +83,8 @@ enum LayoutRestorer {
                 details.append("  MISS \(layout.appName) idx=\(layout.windowIndex) '\(layout.windowTitle.prefix(28))' — no open window to place")
                 continue
             }
-            // Past the settle phase, a window sitting on the built-in screen is there because
-            // the user put it there - dragging a window to the laptop must stick even while
-            // this cycle is still waiting on some other app. During the settle phase we do move
-            // built-in windows, since that is exactly the pile macOS makes on reconnect.
-            if !enforce, WindowManager.display(for: win, in: displays)?.isBuiltin == true {
-                details.append("  SKIP \(layout.appName) idx=\(layout.windowIndex) '\(win.title.prefix(24))' — user moved it to the built-in screen")
-                continue
-            }
-            // Already done earlier in this cycle: leave it alone, so the user can resize it
-            // while we are still waiting for some other app to reopen.
-            if !enforce, placedThisCycle.contains(layout.id) {
+            // Once restored, leave user moves/resizes and freshly captured layouts alone.
+            if !enforce, !pending.contains(layout.id) {
                 moved += 1
                 alreadyInPlace += 1
                 continue
@@ -97,7 +92,7 @@ enum LayoutRestorer {
             if win.frame.matches(target) {
                 moved += 1
                 alreadyInPlace += 1
-                placedThisCycle.insert(layout.id)
+                pending.remove(layout.id)
                 continue
             }
             let ok = WindowManager.setFrame(win.element, target)
@@ -105,21 +100,22 @@ enum LayoutRestorer {
             var note = ""
             if ok {
                 moved += 1
-                placedThisCycle.insert(layout.id)
-            } else if let previous = lastAchieved[layout.id], previous.matches(actual) {
+                pending.remove(layout.id)
+            } else if win.isOnScreen, actual.width > 0, actual.height > 0,
+                      disp.bounds.contains(CGPoint(x: actual.midX, y: actual.midY)),
+                      let previous = lastAchieved[layout.id], previous.matches(actual) {
                 // Second attempt landed in exactly the same place: the app will not accept the
                 // saved frame. Take what it gives, remember that, and stop fighting it.
                 moved += 1
-                placedThisCycle.insert(layout.id)
+                pending.remove(layout.id)
                 let settled = CGRect(x: actual.origin.x - disp.bounds.origin.x,
                                      y: actual.origin.y - disp.bounds.origin.y,
                                      width: actual.width, height: actual.height)
-                LayoutStore.shared.replaceFrame(setKey: setKey, bundleID: layout.appBundleID,
-                                                windowIndex: layout.windowIndex, with: settled)
+                LayoutStore.shared.replaceFrame(setKey: setKey, windowID: layout.id, with: settled)
                 note = " — app refused this frame; saving what it allows"
             } else {
                 lastAchieved[layout.id] = actual
-                pendingPlacements += 1
+                if win.isOnScreen { pendingPlacements += 1 }
             }
             details.append("  \(ok ? "OK  " : "BAD ") \(layout.appName) idx=\(layout.windowIndex) via=\(LayoutMatcher.reason(layout, win)) '\(win.title.prefix(24))' want=\(str(target)) got=\(str(actual))\(note)")
         }

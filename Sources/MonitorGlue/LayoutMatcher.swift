@@ -1,54 +1,34 @@
 import AppKit
 
-/// Works out which open window belongs to which saved layout.
-///
-/// Both restoring and forgetting need the same answer, and they must agree: if capture decides
-/// a saved entry belongs to a window the user parked on the built-in screen, restore has to
-/// reach the same conclusion, or one undoes the other.
+/// Shared by capture and restore so both identify the same window across Space switches.
 enum LayoutMatcher {
-
-    /// - Returns: index into `layouts` → the open window it refers to.
     static func match(_ layouts: [WindowLayout], to live: [LiveWindow]) -> [Int: LiveWindow] {
         var assignment: [Int: LiveWindow] = [:]
-        var used = Set<UInt>()
+        var used = Set<Int>()
+        func claim(_ i: Int, _ j: Int) { assignment[i] = live[j]; used.insert(j) }
 
-        func token(_ w: LiveWindow) -> UInt { UInt(bitPattern: ObjectIdentifier(w.element).hashValue) }
-        func claim(_ i: Int, _ w: LiveWindow) { assignment[i] = w; used.insert(token(w)) }
-        func available(_ bundleID: String) -> [LiveWindow] {
-            live.filter { $0.appBundleID == bundleID && !used.contains(token($0)) }
-        }
-
-        // Strongest signal first, across all layouts, so an early weak guess cannot steal the
-        // window a later layout identifies exactly.
-        for (i, layout) in layouts.enumerated() where assignment[i] == nil {
-            guard !layout.windowTitle.isEmpty else { continue }
-            if let w = available(layout.appBundleID).first(where: { $0.title == layout.windowTitle }) {
-                claim(i, w)
+        for (i, layout) in layouts.enumerated() {
+            guard let identity = layout.identity else { continue }
+            if let j = live.indices.first(where: { !used.contains($0) && live[$0].identity == identity }) {
+                claim(i, j)
             }
         }
+        // Old files and relaunched apps have no usable window number. Only a unique title
+        // is safe: window-list indices and duplicate titles can refer to another Space.
         for (i, layout) in layouts.enumerated() where assignment[i] == nil {
-            if let w = available(layout.appBundleID).first(where: { $0.index == layout.windowIndex }) {
-                claim(i, w)
+            guard layout.identity?.isRunning != true, !layout.windowTitle.isEmpty else { continue }
+            let saved = layouts.indices.filter {
+                layouts[$0].appBundleID == layout.appBundleID && layouts[$0].windowTitle == layout.windowTitle
             }
-        }
-        // Last resort: only when there is nothing to get wrong — exactly one unmatched saved
-        // window for the app and exactly one unmatched open window. Guessing beyond that is how
-        // a window the user deliberately moved to the laptop got dragged back to the monitor.
-        for (i, layout) in layouts.enumerated() where assignment[i] == nil {
-            let candidates = available(layout.appBundleID)
-            let unmatchedForApp = layouts.enumerated()
-                .filter { $0.element.appBundleID == layout.appBundleID && assignment[$0.offset] == nil }
-            if candidates.count == 1, unmatchedForApp.count == 1 {
-                claim(i, candidates[0])
+            let candidates = live.indices.filter {
+                !used.contains($0) && live[$0].appBundleID == layout.appBundleID && live[$0].title == layout.windowTitle
             }
+            if saved.count == 1, candidates.count == 1 { claim(i, candidates[0]) }
         }
         return assignment
     }
 
-    /// How a layout was matched, for the log.
     static func reason(_ layout: WindowLayout, _ window: LiveWindow) -> String {
-        if !layout.windowTitle.isEmpty, window.title == layout.windowTitle { return "title" }
-        if window.index == layout.windowIndex { return "index" }
-        return "only-window"
+        layout.identity == window.identity ? "window-id" : "title"
     }
 }
